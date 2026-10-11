@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # PULSAR — Sprint 1 Core Platform
 
 > **Nền tảng kết nối doanh nghiệp với freelancer, sinh viên và chuyên gia để giải quyết bài toán thực tế.**
@@ -235,3 +236,16 @@ Mở trình duyệt tại: `http://localhost:3000`
 1. **Supabase Rate Limiting**: Trong môi trường production, cần bật Rate Limiting cho endpoint email để chống brute-force mật khẩu.
 2. **MFA / 2FA**: Cần tích hợp Supabase TOTP / Multi-Factor Authentication cho các tài khoản có vai trò `admin`.
 3. **E2E Testing trong CI/CD**: Khi gắn kết nối với Supabase Cloud thật trong pipeline GitHub Actions, chạy `npx playwright test` với cơ sở dữ liệu test chuyên dụng.
+=======
+<div align="center">
+
+<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+
+  <h1>Built with AI Studio</h2>
+
+  <p>The fastest path from prompt to production with Gemini.</p>
+
+  <a href="https://aistudio.google.com/apps">Start building</a>
+
+</div>
+>>>>>>> bb81b37686936bdd164340c933cf2455cdb215b1
