@@ -1,0 +1,6 @@
+{
+  "name": "PULSAR Platform - Core Auth & RBAC",
+  "description": "Enterprise-ready foundation for PULSAR: Supabase Auth, PostgreSQL RLS migrations, strict role-based access control, organization management, and audit logging.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
