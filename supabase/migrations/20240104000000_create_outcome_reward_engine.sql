@@ -143,7 +143,7 @@ AS $$
 DECLARE
     v_challenge RECORD;
     v_submission RECORD;
-    v_user_role TEXT;
+    v_is_admin BOOLEAN;
     v_reward_id UUID;
     v_ref_code TEXT;
 BEGIN
@@ -162,20 +162,23 @@ BEGIN
         RAISE EXCEPTION 'Outcome organization does not match challenge organization';
     END IF;
 
-    -- Lấy role của người ra quyết định
-    SELECT role INTO v_user_role
-    FROM public.profiles
-    WHERE id = NEW.decided_by;
+    -- Lấy role của người ra quyết định (SP8A.2: roles live in user_roles,
+    -- NOT profiles — the old profiles.role reference errored on every write)
+    SELECT EXISTS (
+        SELECT 1 FROM public.user_roles
+        WHERE user_id = NEW.decided_by AND role = 'admin'
+    ) INTO v_is_admin;
 
     -- Phân tách nhiệm vụ (Separation of Duties):
     -- Người tạo challenge không được tự chốt kết quả trừ khi là Super Admin hoặc là Business Owner
-    IF v_challenge.created_by = NEW.decided_by AND v_user_role != 'admin' THEN
-        -- Kiểm tra xem người này có quyền owner trong org không
+    IF v_challenge.created_by = NEW.decided_by AND NOT v_is_admin THEN
+        -- Kiểm tra xem người này có quyền owner trong org không (SP8A.2: column
+        -- is membership_role, NOT role — the old predicate errored)
         IF NOT EXISTS (
             SELECT 1 FROM public.organization_members
             WHERE organization_id = NEW.organization_id
               AND user_id = NEW.decided_by
-              AND role = 'owner'
+              AND membership_role = 'owner'
         ) THEN
             RAISE EXCEPTION 'Separation of Duties violation: Challenge creator cannot approve outcome without organization owner role or admin privileges.';
         END IF;
@@ -392,10 +395,10 @@ CREATE POLICY "outcomes_insert_org_manager_or_admin"
     WITH CHECK (
         public.is_admin() OR
         EXISTS (
-            SELECT 1 FROM public.organization_members
-            WHERE organization_id = organization_id
-              AND user_id = auth.uid()
-              AND role IN ('owner', 'admin', 'manager')
+            SELECT 1 FROM public.organization_members om
+            WHERE om.organization_id = organization_id
+              AND om.user_id = auth.uid()
+              AND om.membership_role = 'owner'
         )
     );
 
@@ -406,19 +409,19 @@ CREATE POLICY "outcomes_update_org_manager_or_admin"
     USING (
         (public.is_admin() OR
         EXISTS (
-            SELECT 1 FROM public.organization_members
-            WHERE organization_id = organization_id
-              AND user_id = auth.uid()
-              AND role IN ('owner', 'admin', 'manager')
+            SELECT 1 FROM public.organization_members om
+            WHERE om.organization_id = organization_id
+              AND om.user_id = auth.uid()
+              AND om.membership_role = 'owner'
         )) AND status != 'finalized'
     )
     WITH CHECK (
         public.is_admin() OR
         EXISTS (
-            SELECT 1 FROM public.organization_members
-            WHERE organization_id = organization_id
-              AND user_id = auth.uid()
-              AND role IN ('owner', 'admin', 'manager')
+            SELECT 1 FROM public.organization_members om
+            WHERE om.organization_id = organization_id
+              AND om.user_id = auth.uid()
+              AND om.membership_role = 'owner'
         )
     );
 
@@ -445,19 +448,19 @@ CREATE POLICY "rewards_update_org_manager_or_admin"
     USING (
         public.is_admin() OR
         EXISTS (
-            SELECT 1 FROM public.organization_members
-            WHERE organization_id = organization_id
-              AND user_id = auth.uid()
-              AND role IN ('owner', 'admin', 'manager')
+            SELECT 1 FROM public.organization_members om
+            WHERE om.organization_id = organization_id
+              AND om.user_id = auth.uid()
+              AND om.membership_role = 'owner'
         )
     )
     WITH CHECK (
         public.is_admin() OR
         EXISTS (
-            SELECT 1 FROM public.organization_members
-            WHERE organization_id = organization_id
-              AND user_id = auth.uid()
-              AND role IN ('owner', 'admin', 'manager')
+            SELECT 1 FROM public.organization_members om
+            WHERE om.organization_id = organization_id
+              AND om.user_id = auth.uid()
+              AND om.membership_role = 'owner'
         )
     );
 
