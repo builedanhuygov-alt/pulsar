@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import type { Reward, RewardStatus, RewardStatusHistory } from '../../types/outcome.types';
 import type { PulsarUser } from '../../types/auth.types';
-import { outcomeRewardService } from '../../lib/outcome/outcomeRewardService';
+import { outcomeRewardService, isRewardTransitionAllowed } from '../../lib/outcome/outcomeRewardService';
 
 interface RewardManagerProps {
   user: PulsarUser | null;
@@ -68,11 +68,56 @@ export const RewardManager: React.FC<RewardManagerProps> = ({ user }) => {
     } else if (data) {
       setMessage({
         type: 'success',
-        text: `Đã cập nhật trạng thái giải thưởng sang "${newStatus}" thành công qua Mock Escrow Adapter.`,
+        text:
+          newStatus === 'paid'
+            ? 'Đã ghi nhận attested-paid (xác nhận thủ công qua Mock Escrow Adapter — KHÔNG phải bằng chứng thanh toán; cần payment record để xác minh).'
+            : `Đã cập nhật trạng thái giải thưởng sang "${newStatus}" thành công qua Mock Escrow Adapter.`,
       });
       setSelectedReward(data);
       setActionNotes('');
       // Refresh list & history
+      await loadRewards();
+      const { data: hist } = await outcomeRewardService.getRewardHistory(data.id);
+      setHistory(hist);
+    }
+    setActionLoading(false);
+  };
+
+  // SP8A.2: UI mirrors the service matrix (service remains authoritative).
+  // Only org owners/admins see actionable controls; illegal edges are disabled.
+  const canManageReward =
+    !!user &&
+    !!selectedReward &&
+    (user.role === 'admin' ||
+      (user.organizations?.some(
+        (m) =>
+          m.organization.id === selectedReward.organization_id &&
+          (m.membership_role === 'owner' || (m.membership_role as string) === 'admin')
+      ) ??
+        false));
+
+  const edgeAllowed = (target: RewardStatus): boolean =>
+    !!selectedReward && isRewardTransitionAllowed(selectedReward.status, target);
+
+  const handleReprocess = async () => {
+    if (!selectedReward || !user) return;
+    if (actionNotes.trim().length < 15) {
+      setMessage({ type: 'error', text: 'Yêu cầu xử lý lại cần lý do tối thiểu 15 ký tự (phục vụ kiểm toán).' });
+      return;
+    }
+    setActionLoading(true);
+    setMessage(null);
+    const { data, error } = await outcomeRewardService.requestRewardReprocessing(
+      selectedReward.id,
+      user,
+      actionNotes.trim()
+    );
+    if (error) {
+      setMessage({ type: 'error', text: error });
+    } else if (data) {
+      setMessage({ type: 'success', text: 'Đã mở xử lý lại (paid → processing) qua workflow kiểm toán chuyên biệt.' });
+      setSelectedReward(data);
+      setActionNotes('');
       await loadRewards();
       const { data: hist } = await outcomeRewardService.getRewardHistory(data.id);
       setHistory(hist);
@@ -291,7 +336,14 @@ export const RewardManager: React.FC<RewardManagerProps> = ({ user }) => {
 
                 <div className="flex flex-wrap gap-2">
                   <button
-                    disabled={actionLoading || selectedReward.status === 'processing'}
+                    disabled={actionLoading || !canManageReward || !edgeAllowed('processing')}
+                    title={
+                      !canManageReward
+                        ? 'Chỉ chủ tổ chức hoặc quản trị viên được đổi trạng thái'
+                        : !edgeAllowed('processing')
+                        ? `Không thể chuyển ${selectedReward.status} → processing (ma trận SP8A.1)`
+                        : 'Chuyển sang processing'
+                    }
                     onClick={() => handleStatusChange('processing')}
                     className="px-3 py-1.5 text-xs font-medium rounded-lg bg-cyan-900/40 hover:bg-cyan-900/60 text-cyan-200 border border-cyan-700/50 disabled:opacity-50 transition"
                   >
@@ -299,7 +351,14 @@ export const RewardManager: React.FC<RewardManagerProps> = ({ user }) => {
                   </button>
 
                   <button
-                    disabled={actionLoading || selectedReward.status === 'paid'}
+                    disabled={actionLoading || !canManageReward || !edgeAllowed('paid')}
+                    title={
+                      !canManageReward
+                        ? 'Chỉ chủ tổ chức hoặc quản trị viên được đổi trạng thái'
+                        : !edgeAllowed('paid')
+                        ? `Không thể chuyển ${selectedReward.status} → paid (ghi nhận attested, cần qua processing)`
+                        : 'Ghi nhận attested-paid (KHÔNG phải bằng chứng thanh toán)'
+                    }
                     onClick={() => handleStatusChange('paid')}
                     className="px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-900/40 hover:bg-emerald-900/60 text-emerald-200 border border-emerald-700/50 disabled:opacity-50 transition"
                   >
@@ -307,13 +366,40 @@ export const RewardManager: React.FC<RewardManagerProps> = ({ user }) => {
                   </button>
 
                   <button
-                    disabled={actionLoading || selectedReward.status === 'cancelled'}
+                    disabled={actionLoading || !canManageReward || !edgeAllowed('cancelled')}
+                    title={
+                      !canManageReward
+                        ? 'Chỉ chủ tổ chức hoặc quản trị viên được đổi trạng thái'
+                        : !edgeAllowed('cancelled')
+                        ? `Không thể chuyển ${selectedReward.status} → cancelled (trạng thái cuối)`
+                        : 'Hủy giải ngân'
+                    }
                     onClick={() => handleStatusChange('cancelled')}
                     className="px-3 py-1.5 text-xs font-medium rounded-lg bg-rose-900/40 hover:bg-rose-900/60 text-rose-200 border border-rose-700/50 disabled:opacity-50 transition"
                   >
                     Hủy giải ngân (Cancel)
                   </button>
+
+                  {selectedReward.status === 'paid' && (
+                    <button
+                      disabled={actionLoading || !canManageReward}
+                      title={
+                        canManageReward
+                          ? 'Mở xử lý lại qua workflow kiểm toán chuyên biệt (cần lý do ≥ 15 ký tự)'
+                          : 'Chỉ chủ tổ chức hoặc quản trị viên được yêu cầu xử lý lại'
+                      }
+                      onClick={handleReprocess}
+                      className="px-3 py-1.5 text-xs font-medium rounded-lg bg-purple-900/40 hover:bg-purple-900/60 text-purple-200 border border-purple-700/50 disabled:opacity-50 transition"
+                    >
+                      Yêu cầu xử lý lại (Reprocessing có kiểm toán)
+                    </button>
+                  )}
                 </div>
+                {!canManageReward && (
+                  <p className="text-[11px] text-slate-500">
+                    Bạn đang xem ở chế độ chỉ đọc. Đổi trạng thái cần quyền chủ tổ chức hoặc quản trị viên (service sẽ từ chối 403 nếu không đủ quyền).
+                  </p>
+                )}
 
                 <div>
                   <input

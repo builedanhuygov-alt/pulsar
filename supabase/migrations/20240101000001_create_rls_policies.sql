@@ -17,7 +17,11 @@ ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
 -- ------------------------------------------------------------------------------
 
 -- Check if current authenticated user has admin role
-CREATE OR REPLACE FUNCTION public.is_admin()
+-- SP8A.2: flexible signature — check_user_id defaults to auth.uid() so both
+-- single-arg (is_admin()) and explicit two-arg (is_admin(uid)) calls work.
+-- Older single-signature overloads are dropped to avoid ambiguity.
+DROP FUNCTION IF EXISTS public.is_admin();
+CREATE OR REPLACE FUNCTION public.is_admin(check_user_id UUID DEFAULT auth.uid())
 RETURNS BOOLEAN
 LANGUAGE sql
 STABLE
@@ -27,13 +31,14 @@ AS $$
     SELECT EXISTS (
         SELECT 1
         FROM public.user_roles
-        WHERE user_id = auth.uid()
+        WHERE user_id = check_user_id
           AND role = 'admin'
     );
 $$;
 
 -- Check if current authenticated user is a member of target organization
-CREATE OR REPLACE FUNCTION public.is_org_member(target_org_id UUID)
+DROP FUNCTION IF EXISTS public.is_org_member(UUID);
+CREATE OR REPLACE FUNCTION public.is_org_member(target_org_id UUID, check_user_id UUID DEFAULT auth.uid())
 RETURNS BOOLEAN
 LANGUAGE sql
 STABLE
@@ -44,12 +49,13 @@ AS $$
         SELECT 1
         FROM public.organization_members
         WHERE organization_id = target_org_id
-          AND user_id = auth.uid()
+          AND user_id = check_user_id
     );
 $$;
 
 -- Check if current authenticated user is an owner of target organization
-CREATE OR REPLACE FUNCTION public.is_org_owner(target_org_id UUID)
+DROP FUNCTION IF EXISTS public.is_org_owner(UUID);
+CREATE OR REPLACE FUNCTION public.is_org_owner(target_org_id UUID, check_user_id UUID DEFAULT auth.uid())
 RETURNS BOOLEAN
 LANGUAGE sql
 STABLE
@@ -60,7 +66,7 @@ AS $$
         SELECT 1
         FROM public.organization_members
         WHERE organization_id = target_org_id
-          AND user_id = auth.uid()
+          AND user_id = check_user_id
           AND membership_role = 'owner'
     );
 $$;
@@ -240,11 +246,13 @@ REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.audit_logs FROM public, 
 GRANT SELECT ON TABLE public.audit_logs TO authenticated;
 
 -- Helper Functions: Revoke default EXECUTE from PUBLIC and anon; grant strictly to authenticated and service_role for RLS
-REVOKE EXECUTE ON FUNCTION public.is_admin() FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated, service_role;
+-- SP8A.2: grants target the flexible (UUID, UUID) overloads (old single-arg
+-- overloads are dropped above, so no stale signature remains executable).
+REVOKE EXECUTE ON FUNCTION public.is_admin(UUID) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.is_admin(UUID) TO authenticated, service_role;
 
-REVOKE EXECUTE ON FUNCTION public.is_org_member(UUID) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION public.is_org_member(UUID) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION public.is_org_member(UUID, UUID) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.is_org_member(UUID, UUID) TO authenticated, service_role;
 
-REVOKE EXECUTE ON FUNCTION public.is_org_owner(UUID) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION public.is_org_owner(UUID) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION public.is_org_owner(UUID, UUID) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.is_org_owner(UUID, UUID) TO authenticated, service_role;

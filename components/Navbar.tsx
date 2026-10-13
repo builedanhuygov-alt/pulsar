@@ -29,10 +29,10 @@ export const Navbar: React.FC<NavbarProps> = ({
               <div className="flex items-center gap-2">
                 <span className="font-bold text-white tracking-tight text-lg">PULSAR</span>
                 <span className="text-[10px] font-semibold tracking-wider uppercase px-2 py-0.5 rounded bg-violet-500/10 text-violet-400 border border-violet-500/20">
-                  Sprint 6 Engine
+                  Sprint 7 Engine
                 </span>
               </div>
-              <p className="text-xs text-slate-400 font-mono hidden sm:block">AI Matching • Recommendations • Copilot</p>
+              <p className="text-xs text-slate-400 font-mono hidden sm:block">Collaboration • Messaging • Tasks • Milestones</p>
             </div>
           </div>
 
@@ -162,6 +162,26 @@ export const Navbar: React.FC<NavbarProps> = ({
                 Chấm Điểm
               </button>
             )}
+            <button
+              onClick={() => setActiveTab('collaboration')}
+              className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-1.5 ${
+                activeTab === 'collaboration'
+                  ? 'bg-teal-600 text-white shadow-sm'
+                  : 'text-teal-400 hover:text-teal-300 hover:bg-teal-950/40'
+              }`}
+            >
+              Cộng Tác
+            </button>
+            <button
+              onClick={() => setActiveTab('finance')}
+              className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-1.5 ${
+                activeTab === 'finance'
+                  ? 'bg-emerald-600 text-white shadow-sm'
+                  : 'text-emerald-400 hover:text-emerald-300 hover:bg-emerald-950/40'
+              }`}
+            >
+              Tài Chính
+            </button>
             {user?.role === 'admin' && (
               <button
                 onClick={() => setActiveTab('admin-reviews')}

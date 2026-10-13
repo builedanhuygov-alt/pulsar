@@ -4,7 +4,7 @@ import type { PulsarUser } from '../types/auth.types';
 
 describe('PULSAR Sprint 7 — Collaboration & Communication Engine Suite', () => {
   // Test users
-  const businessUser: PulsarUser = {
+  const businessUser = {
     id: 'usr-biz-001',
     email: 'business@techcorp.dev',
     role: 'business',
@@ -33,9 +33,9 @@ describe('PULSAR Sprint 7 — Collaboration & Communication Engine Suite', () =>
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
     },
-  };
+  } as unknown as PulsarUser;
 
-  const winningCreatorUser: PulsarUser = {
+  const winningCreatorUser = {
     id: 'usr-creator-001',
     email: 'creator.developer@pulsar.dev',
     role: 'creator',
@@ -52,9 +52,9 @@ describe('PULSAR Sprint 7 — Collaboration & Communication Engine Suite', () =>
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
     },
-  };
+  } as unknown as PulsarUser;
 
-  const outsiderUser: PulsarUser = {
+  const outsiderUser = {
     id: 'usr-outsider-999',
     email: 'outsider@pulsar.dev',
     role: 'creator',
@@ -71,9 +71,9 @@ describe('PULSAR Sprint 7 — Collaboration & Communication Engine Suite', () =>
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
     },
-  };
+  } as unknown as PulsarUser;
 
-  const systemAdminUser: PulsarUser = {
+  const systemAdminUser = {
     id: 'usr-admin-001',
     email: 'admin@pulsar.dev',
     role: 'admin',
@@ -90,7 +90,7 @@ describe('PULSAR Sprint 7 — Collaboration & Communication Engine Suite', () =>
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
     },
-  };
+  } as unknown as PulsarUser;
 
   describe('1. Workspace Access Eligibility & Creation Safeguards', () => {
     it('SP7-WS-1: Rejects workspace creation by unselected/unmatched outsider creator (403)', async () => {
@@ -310,15 +310,15 @@ describe('PULSAR Sprint 7 — Collaboration & Communication Engine Suite', () =>
       expect(updateRes.success).toBe(true);
       expect(updateRes.task?.status).toBe('in_progress');
 
-      // Update status to done
+      // Update status to completed (spec §4 canonical; legacy 'done' normalized)
       const finishRes = collaborationService.updateTaskStatus(
         'ws-demo-001',
         taskId,
-        'done',
+        'completed',
         winningCreatorUser
       );
       expect(finishRes.success).toBe(true);
-      expect(finishRes.task?.status).toBe('done');
+      expect(finishRes.task?.status).toBe('completed');
     });
   });
 
@@ -348,7 +348,7 @@ describe('PULSAR Sprint 7 — Collaboration & Communication Engine Suite', () =>
       );
 
       expect(approveRes.success).toBe(true);
-      expect(approveRes.milestone?.status).toBe('approved');
+      expect(approveRes.milestone?.status).toBe('completed');
 
       // Verify chat notification posted
       const messages = collaborationService.getMessages('ws-demo-001', businessUser);

@@ -20,6 +20,8 @@ import { SkillEvidencePanel } from '../components/reputation/SkillEvidencePanel'
 import { BusinessAnalyticsDashboard } from '../components/reputation/BusinessAnalyticsDashboard';
 import { IntegrityReviewQueue } from '../components/reputation/IntegrityReviewQueue';
 import { CreatorRecommendationFeed } from '../components/matching/CreatorRecommendationFeed';
+import { CollaborationWorkspace } from '../components/collaboration/CollaborationWorkspace';
+import { FinancialOperations } from '../components/finance/FinancialOperations';
 import { isSupabaseConfigured } from '../lib/supabase/client';
 import type { PulsarUser } from '../types/auth.types';
 import { Shield, Sparkles, Building2, User, Database, Terminal, CheckCircle2, AlertTriangle, Layers, Award, Trophy, DollarSign } from 'lucide-react';
@@ -83,13 +85,13 @@ export default function App() {
             <div className="max-w-3xl">
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-violet-500/10 border border-violet-500/20 text-violet-400 text-xs font-semibold mb-3">
                 <Sparkles className="w-3.5 h-3.5" />
-                <span>Sprint 6: AI Matching, Recommendations & Copilot Engine • Gợi Ý Cá Nhân Hóa & Tinh Chỉnh Đề Bài</span>
+                <span>Sprint 7: Collaboration & Communication Engine • Workspace, Messaging, Tasks, Milestones & Notifications</span>
               </div>
               <h1 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
-                PULSAR AI Matching, Recommendations & Challenge Copilot Engine
+                PULSAR Collaboration & Communication Engine
               </h1>
               <p className="mt-2 text-sm text-slate-400 leading-relaxed">
-                Nền tảng kết nối doanh nghiệp với freelancer và chuyên gia giải quyết bài toán thực tế. Sprint 6 hoàn thiện hệ thống gợi ý thông minh đối chiếu 5 thành phần có trọng số (Skill 35%, Evidence 25%, Domain 15%, Track Record 15%, Availability 10%), luồng đề xuất cá nhân hóa có thể giải thích (Creator Feed), đối chiếu nhân tài cho doanh nghiệp (Talent Match) và trợ lý Challenge AI Copilot tối ưu hóa bài toán và Rubric.
+                Môi trường cộng tác an toàn giữa doanh nghiệp và Creator sau kết nối: workspace theo challenge/submission hợp lệ, hội thoại polling thủ công, kanban nhiệm vụ theo giờ thực, mốc bàn giao tách khỏi thanh toán/outcome, và thông báo cô lập theo người nhận.
               </p>
 
               <div className="mt-4 flex flex-wrap gap-2 text-xs font-mono">
@@ -256,6 +258,29 @@ export default function App() {
               </p>
             </div>
           ))}
+
+        {activeTab === 'collaboration' &&
+          (user ? (
+            <CollaborationWorkspace user={user} />
+          ) : (
+            <div className="text-center py-12 bg-slate-900/50 border border-slate-800 rounded-2xl p-6">
+              <User className="w-12 h-12 text-slate-600 mx-auto mb-3" />
+              <h3 className="text-lg font-semibold text-slate-200">
+                Đăng nhập để vào Không gian Cộng tác
+              </h3>
+              <p className="text-sm text-slate-400 max-w-sm mx-auto mt-1 mb-6">
+                Workspace chỉ mở cho thành viên được cấp quyền (org / creator được chọn / reviewer / admin).
+              </p>
+              <button
+                onClick={() => setActiveTab('auth')}
+                className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded-lg transition shadow-lg shadow-indigo-600/30"
+              >
+                Đăng nhập ngay
+              </button>
+            </div>
+          ))}
+
+        {activeTab === 'finance' && <FinancialOperations user={user} />}
 
         {activeTab === 'challenges' &&
           (user ? (

@@ -38,6 +38,15 @@ export const sendMessageSchema = z.object({
     .default([])
     .optional(),
   is_pinned: z.boolean().default(false).optional(),
+  // Idempotency: client-generated UUID per send attempt; safe retry reuses same key.
+  idempotency_key: z.string().min(1).max(100).optional().nullable(),
+});
+
+// Pagination for message history (bounded polling, not fake realtime)
+export const messageHistoryQuerySchema = z.object({
+  page: z.number().int().min(1).default(1),
+  limit: z.number().int().min(1).max(100).default(50),
+  since: z.string().nullable().optional(),
 });
 
 export const createTaskSchema = z.object({
@@ -50,10 +59,23 @@ export const createTaskSchema = z.object({
   assignee_id: z.string().nullable().optional(),
   due_date: z.string().nullable().optional(),
   milestone_id: z.string().nullable().optional(),
+  idempotency_key: z.string().min(1).max(100).optional().nullable(),
 });
 
+// Spec §4: canonical statuses todo/in_progress/blocked/completed/cancelled
 export const updateTaskStatusSchema = z.object({
-  status: z.enum(['todo', 'in_progress', 'review', 'done']),
+  status: z.enum(['todo', 'in_progress', 'blocked', 'completed', 'cancelled']),
+});
+
+export const updateTaskSchema = z.object({
+  title: z.string().min(3, { message: 'Tiêu đề nhiệm vụ tối thiểu 3 ký tự' }).max(150).optional(),
+  description: z.string().max(1000, { message: 'Mô tả tối đa 1000 ký tự' }).optional(),
+  priority: z.enum(['low', 'medium', 'high', 'urgent']).optional(),
+  status: z.enum(['todo', 'in_progress', 'blocked', 'completed', 'cancelled']).optional(),
+  assignee_id: z.string().nullable().optional(),
+  due_date: z.string().nullable().optional(),
+  milestone_id: z.string().nullable().optional(),
+  change_reason: z.string().max(500).optional().nullable(),
 });
 
 export const createMilestoneSchema = z.object({
@@ -71,6 +93,16 @@ export const submitDeliverableSchema = z.object({
   title: z.string().min(3, { message: 'Tên sản phẩm bàn giao tối thiểu 3 ký tự' }),
   url: z.string().min(3, { message: 'Liên kết hoặc đường dẫn bàn giao tối thiểu 3 ký tự' }),
   notes: z.string().max(1000).optional(),
+  // File metadata + versioning (no real upload: URL/metadata only until Storage integrated)
+  file_metadata: z.record(z.string(), z.unknown()).optional(),
+  idempotency_key: z.string().min(1).max(100).optional().nullable(),
+});
+
+// Spec §5: only owner/reviewer/admin may accept; creator can never self-accept.
+export const reviewDeliverableSchema = z.object({
+  deliverable_id: z.string().min(1, { message: 'Mã deliverable không hợp lệ' }),
+  decision: z.enum(['under_review', 'changes_requested', 'accepted', 'rejected']),
+  feedback: z.string().max(2000).optional().default(''),
 });
 
 export const addMemberSchema = z.object({
@@ -80,9 +112,33 @@ export const addMemberSchema = z.object({
   role: z.enum(['creator', 'reviewer', 'member', 'observer', 'admin']),
 });
 
-export type CreateWorkspaceInput = z.infer<typeof createWorkspaceSchema>;
-export type SendMessageInput = z.infer<typeof sendMessageSchema>;
-export type CreateTaskInput = z.infer<typeof createTaskSchema>;
-export type CreateMilestoneInput = z.infer<typeof createMilestoneSchema>;
-export type SubmitDeliverableInput = z.infer<typeof submitDeliverableSchema>;
-export type AddMemberInput = z.infer<typeof addMemberSchema>;
+// Spec §6: notifications — generic body only (≤1000 chars), strict recipient isolation,
+// idempotency dedup, no email/push provider claimed.
+export const createNotificationSchema = z.object({
+  recipient_id: z.string().min(1, { message: 'recipient_id không hợp lệ' }),
+  type: z.enum([
+    'new_message',
+    'workspace_invitation',
+    'task_assigned',
+    'task_deadline_changed',
+    'deliverable_reviewed',
+    'milestone_due_soon',
+    'revision_requested',
+  ]),
+  entity_type: z.enum(['workspace', 'message', 'task', 'milestone', 'deliverable']),
+  entity_id: z.string().min(1, { message: 'entity_id không hợp lệ' }),
+  title: z.string().min(3).max(200),
+  body: z.string().min(1).max(1000, { message: 'Notification body tối đa 1000 ký tự, không chứa dữ liệu bí mật' }),
+  idempotency_key: z.string().min(1).max(100).optional().nullable(),
+});
+
+export type CreateWorkspaceInput = z.input<typeof createWorkspaceSchema>;
+export type SendMessageInput = z.input<typeof sendMessageSchema>;
+export type MessageHistoryQuery = z.input<typeof messageHistoryQuerySchema>;
+export type CreateTaskInput = z.input<typeof createTaskSchema>;
+export type UpdateTaskInput = z.input<typeof updateTaskSchema>;
+export type CreateMilestoneInput = z.input<typeof createMilestoneSchema>;
+export type SubmitDeliverableInput = z.input<typeof submitDeliverableSchema>;
+export type ReviewDeliverableInput = z.input<typeof reviewDeliverableSchema>;
+export type AddMemberInput = z.input<typeof addMemberSchema>;
+export type CreateNotificationInput = z.input<typeof createNotificationSchema>;

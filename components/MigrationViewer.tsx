@@ -7,9 +7,9 @@ export const MigrationViewer: React.FC = () => {
 
   const migrations = [
     {
-      filename: 'consolidated_sprint1_schema.sql',
-      title: '⚡ TOÀN BỘ SPRINT 1 (Chạy 1 lần duy nhất)',
-      description: 'Script tổng hợp nguyên khối (atomic transaction): Tạo 5 bảng, RLS, Anti-Recursion, Triggers, Grants, và Bootstrap Procedure.',
+      filename: 'archive/consolidated_sprint1_schema.sql',
+      title: '⚡ TOÀN BỘ SPRINT 1 — LƯU TRỮ (không nằm trong đường chạy migration)',
+      description: 'Script tổng hợp đã chuyển vào supabase/archive/ để tránh chạy lặp sau các migration có timestamp. Chỉ dùng tham khảo/thảm họa, DBA chạy thủ công khi cần.',
       sql: `-- ==============================================================================
 -- PULSAR PLATFORM - SPRINT 1 CONSOLIDATED DATABASE SCHEMA (1-CLICK RUN)
 -- Chạy toàn bộ trong Supabase SQL Editor:
@@ -727,9 +727,92 @@ NOTIFY pgrst, 'reload schema';
 COMMIT;`,
     },
     {
-      filename: 'rollback_sprint1_schema.sql',
-      title: '⚠️ Rollback Script (Gỡ bỏ Schema)',
-      description: 'Script khôi phục thảm họa: Gỡ bỏ 5 bảng và triggers Sprint 1 (giữ nguyên tài khoản auth.users).',
+      filename: '20240107000000_create_collaboration_workspace.sql',
+      title: '🤝 SPRINT 7: Collaboration Workspace (workspaces, messages, tasks, milestones, deliverables, notifications)',
+      description: 'Tạo 7 bảng cộng tác + RLS cách ly theo workspace membership và recipient. Xem file đầy đủ tại supabase/migrations/.',
+      sql: `-- ==============================================================================
+-- PULSAR Sprint 7: Collaboration, Messaging, Tasks, Milestones & Notifications
+-- File đầy đủ: supabase/migrations/20240107000000_create_collaboration_workspace.sql
+-- Chạy SAU các migration SP1–SP6 trong Supabase SQL Editor (KHÔNG chạy tự động).
+-- ==============================================================================
+-- Tables:
+--   workspaces(challenge_id, organization_id, submission_id, status, stage)
+--   workspace_members(workspace_id, user_id, role, status)  -- active/invited/removed
+--   messages(workspace_id, sender_id, content<=2000, idempotency_key UNIQUE)
+--   tasks(workspace_id, assignee_id, priority, status, due_at, milestone_id)
+--   milestones(workspace_id, due_at, status, order_index)
+--   deliverables(milestone_id, workspace_id, version, status, feedback, reviewed_by/at)
+--   notifications(recipient_id, type, entity_type/id, title, body<=1000, idempotency UNIQUE)
+-- RLS highlights:
+--   * messages/tasks/milestones/deliverables SELECT = active workspace member OR admin
+--   * messages INSERT: sender_id = auth.uid() + active member
+--   * notifications SELECT/UPDATE: recipient_id = auth.uid() (strict isolation)
+--   * Xem SQL đầy đủ trong file migration (368 dòng).`,
+    },
+    {
+      filename: '20240108000000_collaboration_hardening.sql',
+      title: '🛡️ SPRINT 7 HARDENING: task history, activities, reviewer guards, self-accept trigger',
+      description: 'Migration bổ sung sau 07: helpers is_workspace_member/reviewer, FK tasks.milestone_id, bảng lịch sử, trigger chống tự nghiệm thu. Idempotent, không xóa dữ liệu.',
+      sql: `-- ==============================================================================
+-- PULSAR Sprint 7 hardening (idempotent, 1 transaction, không xóa dữ liệu)
+-- File đầy đủ: supabase/migrations/20240108000000_collaboration_hardening.sql
+-- Chạy SAU 20240107000000. Chỉ DBA apply thủ công — KHÔNG chạy Cloud tự động.
+-- ==============================================================================
+-- New helpers (SECURITY DEFINER, search_path = public):
+--   is_workspace_member(UUID, UUID), is_workspace_reviewer(UUID, UUID)
+-- New tables (RLS, append-only cho clients):
+--   task_status_history(workspace_id, task_id, previous/new_status, changed_by, reason)
+--   workspace_activities(workspace_id, actor_id, action, target_type/id, details)
+-- Guards:
+--   fk_tasks_milestone, trg_deliverable_no_self_accept (creator ≠ reviewer khi accepted)
+--   notifications: REVOKE INSERT/DELETE cho anon+authenticated (chỉ service_role ghi)
+--   workspaces UPDATE: owner/admin workspace hoặc system admin
+--   Xem SQL đầy đủ trong file migration.`,
+    },
+    {
+      filename: '20240109000000_financial_ledger.sql',
+      title: '💰 SP8A: Financial Ledger & Reconciliation (sổ cái kép, RLS tài chính)',
+      description: 'Sổ cái kép append-only (số nguyên minor units), links reward, payment records, adjustments SoD, đối soát read-only. Chạy sau SP1–SP7, thủ công, không xóa dữ liệu.',
+      sql: `-- ==============================================================================
+-- PULSAR SP8A: Financial Ledger & Reconciliation Engine (idempotent, 1 transaction)
+-- File đầy đủ: supabase/migrations/20240109000000_financial_ledger.sql
+-- Phụ thuộc: 20240104000000 (rewards/outcomes) + SP1 helpers is_org_member/owner/admin.
+-- Chạy SAU SP1–SP7. Chỉ DBA apply thủ công — KHÔNG chạy Cloud tự động.
+-- ==============================================================================
+-- Tables (xem SQL đầy đủ trong file migration):
+--   financial_accounts(org, code, currency) — buckets ghi nhớ, KHÔNG ký quỹ
+--   ledger_transactions(draft/pending/posted/reversed/failed/cancelled, idempotency UNIQUE)
+--   ledger_entries(debit/credit, amount_minor BIGINT > 0) + trigger cân đối nợ=có
+--   reward_ledger_links(reward_id UNIQUE — chống ghi nợ trùng)
+--   payment_records(record-only, evidence simulated/manual/bank, idempotency UNIQUE)
+--   financial_adjustments(maker != checker qua CHECK created_by != reviewed_by)
+--   reconciliation_runs / reconciliation_items(fingerprint, read-only)
+--   financial_audit_events(append-only)
+-- RLS: đọc = org member/admin; ghi = org owner/admin; REVOKE DELETE (bất biến).
+-- Giả định kế toán + rollback xem header file migration.`,
+    },
+    {
+      filename: '20240109000001_reward_transition_guard.sql',
+      title: '🔒 SP8A.1: Reward/Outcome transition guard (ma trận chuyển trạng thái ở DB)',
+      description: 'Trigger PostgreSQL khóa ma trận reward (planned→…→paid/failed/cancelled, paid chỉ quay về processing) + đóng băng outcome finalized/cancelled. Idempotent, không xóa dữ liệu.',
+      sql: `-- ==============================================================================
+-- PULSAR SP8A.1: Reward/Outcome transition guard (idempotent, 1 transaction)
+-- File đầy đủ: supabase/migrations/20240109000001_reward_transition_guard.sql
+-- Phụ thuộc: 20240104000000. Chỉ DBA apply thủ công — KHÔNG chạy Cloud tự động.
+-- ==============================================================================
+-- guard_reward_status_transition() BEFORE UPDATE OF status ON rewards:
+--   planned->pending_approval|cancelled; pending_approval->approved|cancelled;
+--   approved->processing|cancelled; processing->paid|failed|cancelled;
+--   paid->processing (re-processing có kiểm toán); failed/cancelled: terminal.
+-- guard_outcome_status_freeze(): proposed->finalized|cancelled, sau đó bất biến.
+-- Paid qua đường này là ATTESTED (xác nhận thủ công), không phải bằng chứng
+-- thanh toán — verified-paid thuộc tầng ứng dụng (payment_records + đối soát).
+-- Xem SQL đầy đủ trong file migration.`,
+    },
+    {
+      filename: 'archive/rollback_sprint1_schema.sql',
+      title: '⚠️ Rollback Script — LƯU TRỮ (KHÔNG BAO GIỜ tự động chạy)',
+      description: 'Đã chuyển vào supabase/archive/ vì sẽ DROP 5 bảng cốt lõi nếu lọt vào đường chạy migration. Chỉ DBA dùng thủ công khi thảm họa.',
       sql: `-- ==============================================================================
 -- PULSAR PLATFORM - SPRINT 1 ROLLBACK SCRIPT (DISASTER RECOVERY ONLY)
 -- CẢNH BÁO: Script này sẽ gỡ bỏ 5 bảng và functions đã tạo ở Sprint 1.

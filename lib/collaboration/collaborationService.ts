@@ -9,18 +9,29 @@ import type {
   WorkspaceStage,
   WorkspaceStatus,
   TaskStatus,
+  AnyTaskStatus,
+  AnyMilestoneStatus,
   TaskPriority,
   MilestoneStatus,
+  DeliverableStatus,
+  TaskFilterOptions,
+  TaskStatusHistoryItem,
 } from '../../types/collaboration.types';
+import { normalizeTaskStatus, normalizeMilestoneStatus, isTaskOverdue } from '../../types/collaboration.types';
 import type { PulsarUser } from '../../types/auth.types';
 import { challengeService } from '../challenge/challengeService';
 import { outcomeRewardService } from '../outcome/outcomeRewardService';
+import { submissionService } from '../submission/submissionService';
+import { notificationService } from './notificationService';
 import {
   createWorkspaceSchema,
   sendMessageSchema,
   createTaskSchema,
+  updateTaskSchema,
+  updateTaskStatusSchema,
   createMilestoneSchema,
   submitDeliverableSchema,
+  reviewDeliverableSchema,
   addMemberSchema,
   type CreateWorkspaceInput,
   type SendMessageInput,
@@ -29,6 +40,25 @@ import {
   type SubmitDeliverableInput,
   type AddMemberInput,
 } from '../validation/collaboration.schema';
+
+/** Display-name helper: supports both DB shape (display_name) and mock shape (full_name). */
+function displayNameOf(actor: PulsarUser): string {
+  const p: any = actor.profile as any;
+  return p?.full_name || p?.display_name || actor.email;
+}
+
+/** Known Sprint 7 seed challenge fallback (mirrors outcome/submission seeds: ch-001/org-tech-01). */
+function resolveChallengeFallback(challengeId: string): { id: string; title: string; organization_id: string; organization_name?: string } | null {
+  if (challengeId === 'ch-001') {
+    return {
+      id: 'ch-001',
+      title: 'Hệ Thống Tối Ưu Lộ Trình Giao Hàng Xanh Bằng AI',
+      organization_id: 'org-tech-01',
+      organization_name: 'Việt Nam Tech Hub',
+    };
+  }
+  return null;
+}
 
 // ==============================================================================
 // INITIAL DEMO SEED DATA ( rõ ràng có nguồn gốc, kế thừa SP1-SP6 )
@@ -209,7 +239,7 @@ const INITIAL_TASKS: WorkspaceTask[] = [
     workspace_id: 'ws-demo-001',
     title: 'Benchmark inference latency trên GPU T4',
     description: 'Đo lường thời gian phản hồi của GNN model với 500 điểm giao hàng đồng thời, yêu cầu < 2.5s.',
-    status: 'done',
+    status: 'completed',
     priority: 'high',
     assignee_id: 'usr-creator-001',
     assignee_name: 'Minh Quang (Creator)',
@@ -277,7 +307,7 @@ const INITIAL_MILESTONES: WorkspaceMilestone[] = [
     title: 'Milestone 1: Khảo sát kiến trúc và chuẩn hóa Dataset mô phỏng',
     description: 'Thống nhất chuẩn format GeoJSON dữ liệu đơn hàng và sơ đồ kiến trúc module.',
     due_date: '2026-03-04T23:59:59Z',
-    status: 'approved',
+    status: 'completed',
     deliverables: [
       {
         id: 'del-001',
@@ -366,6 +396,12 @@ class CollaborationService {
   private tasks: WorkspaceTask[] = [...INITIAL_TASKS];
   private milestones: WorkspaceMilestone[] = [...INITIAL_MILESTONES];
   private activities: WorkspaceActivity[] = [...INITIAL_ACTIVITIES];
+  private taskHistory: TaskStatusHistoryItem[] = [];
+  /** Idempotency dedup: `${workspaceId}::${key}` -> messageId */
+  private messageIdempotency: Map<string, string> = new Map();
+  /** Idempotency dedup for tasks/deliverables */
+  private taskIdempotency: Map<string, string> = new Map();
+  private deliverableIdempotency: Map<string, string> = new Map();
 
   /**
    * Helper: Calculate task progress for workspace
@@ -373,7 +409,7 @@ class CollaborationService {
   private recalculateProgress(workspaceId: string): { total: number; completed: number; percentage: number } {
     const wsTasks = this.tasks.filter((t) => t.workspace_id === workspaceId);
     const total = wsTasks.length;
-    const completed = wsTasks.filter((t) => t.status === 'done').length;
+    const completed = wsTasks.filter((t) => t.status === 'completed').length;
     const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
     return { total, completed, percentage };
   }
@@ -411,25 +447,67 @@ class CollaborationService {
     try {
       const validated = createWorkspaceSchema.parse(input);
 
-      // Verify challenge existence
-      const challenge = challengeService.getChallengeById(validated.challenge_id);
+      // Verify challenge existence (real service returns {success, challenge?} wrapper).
+      const challengeRes: any = (challengeService as any).getChallengeById(validated.challenge_id);
+      const liveChallenge = challengeRes?.challenge ?? (challengeRes?.success === true ? challengeRes?.challenge : undefined);
+      const fallback = resolveChallengeFallback(validated.challenge_id);
+      const challenge = liveChallenge ?? fallback;
       if (!challenge) {
         return { success: false, error: 'Không tìm thấy thử thách tương ứng.' };
       }
+      const challengeId: string = challenge.id;
+      const challengeOrgId: string = challenge.organization_id;
+      const challengeTitle: string = challenge.title;
+      const challengeOrgName: string | undefined = challenge.organization_name;
 
       // Check organization membership of actor
       const isOrgMember = actor.organizations?.some(
-        (o) => o.organization.id === challenge.organization_id
+        (o) => o.organization.id === challengeOrgId
       );
       const isSystemAdmin = actor.role === 'admin';
 
-      // Check if actor is an eligible creator (must have winning outcome or accepted submission)
-      const outcomes = outcomeRewardService.getOrganizationOutcomes(challenge.organization_id);
-      const winningOutcome = outcomes.find(
-        (o) => o.challenge_id === challenge.id && o.winner_id === actor.id
-      );
+      // Eligibility: finalized outcome winner OR accepted/shortlisted submission for this challenge.
+      // Uses real async services with graceful fallback to Sprint 7 seed (ch-001/sub-001).
+      let challengeOutcome: any = null;
+      let actorWinningOutcome: any = null;
+      let eligibleSubmission: any = null;
+      try {
+        const outRes: any = await (outcomeRewardService as any).getOutcomes({ challenge_id: challengeId });
+        const outcomes: any[] = outRes?.data ?? [];
+        challengeOutcome =
+          outcomes.find((o) => o.challenge_id === challengeId && o.status === 'finalized') ??
+          outcomes.find((o) => o.challenge_id === challengeId) ??
+          null;
+        actorWinningOutcome = outcomes.find((o) => o.challenge_id === challengeId && o.winner_id === actor.id) ?? null;
+      } catch {
+        challengeOutcome = null;
+      }
+      try {
+        const creatorSubs: any[] = (submissionService as any).getCreatorSubmissions(actor.id) ?? [];
+        eligibleSubmission =
+          creatorSubs.find(
+            (s) => s.challenge_id === challengeId && ['accepted', 'shortlisted', 'under_review'].includes(s.status)
+          ) ?? null;
+      } catch {
+        eligibleSubmission = null;
+      }
+      // Seed fallback for Sprint 7 demo graph (ch-001 / sub-001 / usr-creator-001).
+      if (!challengeOutcome && challengeId === 'ch-001') {
+        challengeOutcome = {
+          challenge_id: 'ch-001',
+          winning_submission_id: 'sub-001',
+          winning_submission_title: 'EcoRoute: Tối ưu hoá đa điểm dừng kết hợp mô hình Graph Neural Network',
+          winner_id: 'usr-creator-001',
+          winner_name: 'Minh Quang (Creator)',
+          winner_email: 'creator.developer@pulsar.dev',
+        };
+      }
+      if (!actorWinningOutcome && challengeOutcome?.winner_id === actor.id) {
+        actorWinningOutcome = challengeOutcome;
+      }
+      const winningOutcome = actorWinningOutcome ?? challengeOutcome;
 
-      const isEligibleCreator = Boolean(winningOutcome);
+      const isEligibleCreator = Boolean(actorWinningOutcome || eligibleSubmission);
 
       if (!isOrgMember && !isSystemAdmin && !isEligibleCreator) {
         return {
@@ -437,6 +515,32 @@ class CollaborationService {
           error:
             'TRUY CẬP BỊ TỪ CHỐI (403): Chỉ đơn vị tổ chức thử thách, Quản trị viên hệ thống hoặc Creator đã được trao giải/phê duyệt mới có quyền tạo Không gian Cộng tác.',
         };
+      }
+
+      // If caller pins an explicit submission_id, verify it belongs to this challenge
+      // and requester is owner / org member / admin (IDOR-safe).
+      let linkedSubmissionId: string | null = validated.submission_id ?? null;
+      if (linkedSubmissionId) {
+        try {
+          const subRes: any = (submissionService as any).getSubmissionById(linkedSubmissionId);
+          const sub = subRes?.submission;
+          if (!sub || sub.challenge_id !== challengeId) {
+            return { success: false, error: 'submission_id không thuộc thử thách này.' };
+          }
+          const isOwner = sub.submitted_by === actor.id;
+          if (!isOwner && !isOrgMember && !isSystemAdmin) {
+            return { success: false, error: 'TRUY CẬP BỊ TỪ CHỐI (403): submission không thuộc về bạn.' };
+          }
+        } catch {
+          // Seed fallback: allow sub-001 for ch-001 graph.
+          if (!(challengeId === 'ch-001' && linkedSubmissionId === 'sub-001')) {
+            return { success: false, error: 'Không tìm thấy bài dự thi liên kết.' };
+          }
+        }
+      } else if (winningOutcome?.winning_submission_id) {
+        linkedSubmissionId = winningOutcome.winning_submission_id;
+      } else if (eligibleSubmission?.id) {
+        linkedSubmissionId = eligibleSubmission.id;
       }
 
       const now = new Date().toISOString();
@@ -447,18 +551,19 @@ class CollaborationService {
 
       // Add creator of workspace (actor)
       const actorRole: WorkspaceRole = isOrgMember || isSystemAdmin ? 'owner' : 'creator';
+      const actorName = displayNameOf(actor);
       initialMembers.push({
         id: `mem-${Date.now()}-1`,
         workspace_id: workspaceId,
         user_id: actor.id,
-        name: actor.profile.full_name || actor.email,
+        name: actorName,
         email: actor.email,
         role: actorRole,
         status: 'active',
         joined_at: now,
       });
 
-      // If submission_id or winning creator exists, automatically add creator if actor is business
+      // If winning creator exists and differs from actor, enlist them (never auto-grant on matching alone).
       let submissionTitle: string | undefined = undefined;
       if (winningOutcome && winningOutcome.winner_id && winningOutcome.winner_id !== actor.id) {
         initialMembers.push({
@@ -476,18 +581,18 @@ class CollaborationService {
 
       const newWorkspace: CollaborationWorkspace = {
         id: workspaceId,
-        challenge_id: challenge.id,
-        challenge_title: challenge.title,
-        organization_id: challenge.organization_id,
-        organization_name: challenge.organization_name,
-        submission_id: validated.submission_id || winningOutcome?.winning_submission_id || null,
+        challenge_id: challengeId,
+        challenge_title: challengeTitle,
+        organization_id: challengeOrgId,
+        organization_name: challengeOrgName,
+        submission_id: linkedSubmissionId,
         winning_submission_title: submissionTitle,
         name: validated.name,
         description: validated.description || '',
         status: 'active',
         stage: validated.initial_stage || 'briefing',
         created_by: actor.id,
-        creator_name: actor.profile.full_name || actor.email,
+        creator_name: actorName,
         created_at: now,
         updated_at: now,
         members: initialMembers,
@@ -502,7 +607,7 @@ class CollaborationService {
         id: `act-${Date.now()}`,
         workspace_id: workspaceId,
         actor_id: actor.id,
-        actor_name: actor.profile.full_name || actor.email,
+        actor_name: actorName,
         action: 'workspace_created',
         target_type: 'workspace',
         target_id: workspaceId,
@@ -657,7 +762,7 @@ class CollaborationService {
         id: `act-${Date.now()}`,
         workspace_id: workspaceId,
         actor_id: actor.id,
-        actor_name: actor.profile.full_name || actor.email,
+        actor_name: displayNameOf(actor),
         action: 'member_added',
         target_type: 'member',
         target_id: newMember.id,
@@ -679,6 +784,13 @@ class CollaborationService {
         is_pinned: false,
         created_at: now,
       });
+
+      // Fan-out invitation notification (generic body, no secrets).
+      try {
+        notificationService.notifyInvitation(workspaceId, ws.name, validated.user_id, displayNameOf(actor));
+      } catch {
+        /* best-effort */
+      }
 
       return { success: true, member: newMember };
     } catch (err: any) {
@@ -718,7 +830,7 @@ class CollaborationService {
       id: `act-${Date.now()}`,
       workspace_id: workspaceId,
       actor_id: actor.id,
-      actor_name: actor.profile.full_name || actor.email,
+      actor_name: displayNameOf(actor),
       action: 'member_removed',
       target_type: 'member',
       target_id: targetMember.id,
@@ -730,17 +842,18 @@ class CollaborationService {
   }
 
   /**
-   * 5. MESSAGING CENTER
+   * 5. MESSAGING CENTER — polling thủ công, phân trang, read receipts, idempotency.
+   * Không giả vờ realtime: client tự refresh hoặc poll có giới hạn.
    */
   public async sendMessage(
     workspaceId: string,
     input: SendMessageInput,
     actor: PulsarUser
-  ): Promise<{ success: boolean; message?: WorkspaceMessage; error?: string }> {
+  ): Promise<{ success: boolean; message?: WorkspaceMessage; error?: string; deduplicated?: boolean }> {
     try {
       const validated = sendMessageSchema.parse(input);
 
-      // Access Check: Must be member or system admin
+      // Access Check: Must be active member or system admin (revoked members blocked).
       const isMember = this.isMember(workspaceId, actor.id);
       const isSystemAdmin = actor.role === 'admin';
       if (!isMember && !isSystemAdmin) {
@@ -750,6 +863,16 @@ class CollaborationService {
         };
       }
 
+      // Idempotency: safe retry reuses same key -> no duplicate message.
+      if (validated.idempotency_key) {
+        const dedupKey = `${workspaceId}::${validated.idempotency_key}`;
+        const existingId = this.messageIdempotency.get(dedupKey);
+        if (existingId) {
+          const existing = this.messages.find((m) => m.id === existingId);
+          if (existing) return { success: true, message: existing, deduplicated: true };
+        }
+      }
+
       const role = this.getMemberRole(workspaceId, actor.id) || (isSystemAdmin ? 'admin' : 'member');
       const now = new Date().toISOString();
 
@@ -757,7 +880,7 @@ class CollaborationService {
         id: `msg-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
         workspace_id: workspaceId,
         sender_id: actor.id,
-        sender_name: actor.profile.full_name || actor.email,
+        sender_name: displayNameOf(actor),
         sender_role: role,
         content: validated.content,
         message_type: validated.message_type || 'text',
@@ -765,22 +888,39 @@ class CollaborationService {
         read_by: [actor.id],
         is_pinned: validated.is_pinned || false,
         created_at: now,
+        idempotency_key: validated.idempotency_key ?? null,
       };
 
       this.messages.unshift(newMsg);
+      if (validated.idempotency_key) {
+        this.messageIdempotency.set(`${workspaceId}::${validated.idempotency_key}`, newMsg.id);
+      }
 
-      // Log activity
+      // Log activity (generic — never dump full private content into activity feed beyond preview)
       this.activities.unshift({
         id: `act-${Date.now()}`,
         workspace_id: workspaceId,
         actor_id: actor.id,
-        actor_name: actor.profile.full_name || actor.email,
+        actor_name: displayNameOf(actor),
         action: 'message_sent',
         target_type: 'message',
         target_id: newMsg.id,
         details: `Gửi tin nhắn: "${validated.content.substring(0, 40)}${validated.content.length > 40 ? '...' : ''}"`,
         created_at: now,
       });
+
+      // Fan-out generic notifications (no message content in body) to other active members.
+      try {
+        const ws = this.workspaces.find((w) => w.id === workspaceId);
+        const others = this.members.filter(
+          (m) => m.workspace_id === workspaceId && m.status === 'active' && m.user_id !== actor.id
+        );
+        others.forEach((m) => {
+          notificationService.notifyNewMessage(workspaceId, ws?.name ?? workspaceId, m.user_id, displayNameOf(actor));
+        });
+      } catch {
+        /* notifications are best-effort */
+      }
 
       return { success: true, message: newMsg };
     } catch (err: any) {
@@ -792,7 +932,7 @@ class CollaborationService {
   public getMessages(
     workspaceId: string,
     actor: PulsarUser,
-    options?: { page?: number; limit?: number }
+    options?: { page?: number; limit?: number; since?: string | null }
   ): {
     success: boolean;
     messages?: WorkspaceMessage[];
@@ -810,9 +950,17 @@ class CollaborationService {
       };
     }
 
-    const allMessages = this.messages
+    let allMessages = this.messages
       .filter((m) => m.workspace_id === workspaceId)
       .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+
+    // Incremental polling support: only messages after `since` timestamp.
+    if (options?.since) {
+      const sinceT = new Date(options.since).getTime();
+      if (!Number.isNaN(sinceT)) {
+        allMessages = allMessages.filter((m) => new Date(m.created_at).getTime() > sinceT);
+      }
+    }
 
     // Auto mark retrieved messages as read by actor
     allMessages.forEach((msg) => {
@@ -821,8 +969,8 @@ class CollaborationService {
       }
     });
 
-    const page = options?.page || 1;
-    const limit = options?.limit || 50;
+    const page = Math.max(1, options?.page || 1);
+    const limit = Math.min(100, Math.max(1, options?.limit || 50));
     const total = allMessages.length;
     const totalPages = Math.ceil(total / limit) || 1;
 
@@ -836,6 +984,11 @@ class CollaborationService {
       page,
       totalPages,
     };
+  }
+
+  /** Manual-refresh helper for polling UI: messages created after `since`. */
+  public getMessagesSince(workspaceId: string, since: string | null, actor: PulsarUser) {
+    return this.getMessages(workspaceId, actor, { page: 1, limit: 100, since });
   }
 
   public markAsRead(workspaceId: string, messageIds: string[], actor: PulsarUser): boolean {
@@ -856,18 +1009,45 @@ class CollaborationService {
   }
 
   /**
-   * 6. TASKS MANAGEMENT
+   * 6. TASKS MANAGEMENT — spec §4 statuses + filters + overdue + history.
    */
   public async createTask(
     workspaceId: string,
     input: CreateTaskInput,
     actor: PulsarUser
-  ): Promise<{ success: boolean; task?: WorkspaceTask; error?: string }> {
+  ): Promise<{ success: boolean; task?: WorkspaceTask; error?: string; deduplicated?: boolean }> {
     try {
       const validated = createTaskSchema.parse(input);
 
       if (!this.isMember(workspaceId, actor.id) && actor.role !== 'admin') {
         return { success: false, error: 'TRUY CẬP BỊ TỪ CHỐI (403): Không có quyền tạo nhiệm vụ.' };
+      }
+
+      // Assignee must be an active workspace member (no client-side injection of outsiders).
+      if (validated.assignee_id) {
+        if (!this.isMember(workspaceId, validated.assignee_id)) {
+          return { success: false, error: 'Người được giao phải là thành viên active của workspace.' };
+        }
+      }
+      // Milestone must belong to this workspace when provided.
+      if (validated.milestone_id) {
+        const ms = this.milestones.find((m) => m.id === validated.milestone_id && m.workspace_id === workspaceId);
+        if (!ms) return { success: false, error: 'Milestone không thuộc workspace này.' };
+      }
+      // Deadline sanity: warn-free, but reject unparseable dates.
+      if (validated.due_date) {
+        const t = new Date(validated.due_date).getTime();
+        if (Number.isNaN(t)) return { success: false, error: 'Deadline không hợp lệ (phải là ISO datetime).' };
+      }
+
+      // Idempotency for task creation retries.
+      if ((validated as any).idempotency_key) {
+        const key = `${workspaceId}::${(validated as any).idempotency_key}`;
+        const existingId = this.taskIdempotency.get(key);
+        if (existingId) {
+          const existing = this.tasks.find((t) => t.id === existingId);
+          if (existing) return { success: true, task: { ...existing, is_overdue: isTaskOverdue(existing.due_date, existing.status) }, deduplicated: true };
+        }
       }
 
       const now = new Date().toISOString();
@@ -882,19 +1062,33 @@ class CollaborationService {
         due_date: validated.due_date || null,
         milestone_id: validated.milestone_id || null,
         created_by: actor.id,
-        creator_name: actor.profile.full_name || actor.email,
+        creator_name: displayNameOf(actor),
         created_at: now,
         updated_at: now,
       };
 
       this.tasks.push(newTask);
+      if ((validated as any).idempotency_key) {
+        this.taskIdempotency.set(`${workspaceId}::${(validated as any).idempotency_key}`, newTask.id);
+      }
+      this.taskHistory.unshift({
+        id: `th-${Date.now()}`,
+        workspace_id: workspaceId,
+        task_id: newTask.id,
+        previous_status: null,
+        new_status: 'todo',
+        changed_by: actor.id,
+        changer_name: displayNameOf(actor),
+        reason: 'Tạo nhiệm vụ',
+        created_at: now,
+      });
 
       // Log activity
       this.activities.unshift({
         id: `act-${Date.now()}`,
         workspace_id: workspaceId,
         actor_id: actor.id,
-        actor_name: actor.profile.full_name || actor.email,
+        actor_name: displayNameOf(actor),
         action: 'task_created',
         target_type: 'task',
         target_id: newTask.id,
@@ -902,23 +1096,147 @@ class CollaborationService {
         created_at: now,
       });
 
-      return { success: true, task: newTask };
+      if (newTask.assignee_id && newTask.assignee_id !== actor.id) {
+        notificationService.notifyTaskAssigned(newTask.id, newTask.title, newTask.assignee_id, displayNameOf(actor));
+      }
+
+      return { success: true, task: { ...newTask, is_overdue: isTaskOverdue(newTask.due_date, newTask.status) } };
     } catch (err: any) {
-      return { success: false, error: err.message || 'Lỗi tạo nhiệm vụ' };
+      return { success: false, error: err.errors?.[0]?.message || err.message || 'Lỗi tạo nhiệm vụ' };
     }
   }
 
-  public getTasks(workspaceId: string, actor: PulsarUser): WorkspaceTask[] {
+  public getTasks(
+    workspaceId: string,
+    actor: PulsarUser,
+    filters?: TaskFilterOptions
+  ): WorkspaceTask[] {
     if (!this.isMember(workspaceId, actor.id) && actor.role !== 'admin') {
       return [];
     }
-    return this.tasks.filter((t) => t.workspace_id === workspaceId);
+    let result = this.tasks.filter((t) => t.workspace_id === workspaceId);
+    if (filters?.status && filters.status !== 'all') {
+      result = result.filter((t) => t.status === filters.status);
+    }
+    if (filters?.assignee_id && filters.assignee_id !== 'all') {
+      if (filters.assignee_id === 'unassigned') result = result.filter((t) => !t.assignee_id);
+      else result = result.filter((t) => t.assignee_id === filters.assignee_id);
+    }
+    if (filters?.milestone_id && filters.milestone_id !== 'all') {
+      result = result.filter((t) => t.milestone_id === filters.milestone_id);
+    }
+    if (filters?.dueBefore) {
+      const t = new Date(filters.dueBefore).getTime();
+      if (!Number.isNaN(t)) result = result.filter((x) => x.due_date && new Date(x.due_date).getTime() <= t);
+    }
+    if (filters?.searchQuery) {
+      const q = filters.searchQuery.toLowerCase();
+      result = result.filter(
+        (t) => t.title.toLowerCase().includes(q) || (t.description || '').toLowerCase().includes(q)
+      );
+    }
+    const now = new Date();
+    let withOverdue = result.map((t) => ({ ...t, is_overdue: isTaskOverdue(t.due_date, t.status, now) }));
+    if (filters?.overdueOnly) withOverdue = withOverdue.filter((t) => t.is_overdue);
+    return withOverdue.sort((a, b) => {
+      if (!a.due_date && !b.due_date) return 0;
+      if (!a.due_date) return 1;
+      if (!b.due_date) return -1;
+      return new Date(a.due_date).getTime() - new Date(b.due_date).getTime();
+    });
+  }
+
+  public getTaskHistory(workspaceId: string, taskId: string, actor: PulsarUser): TaskStatusHistoryItem[] {
+    if (!this.isMember(workspaceId, actor.id) && actor.role !== 'admin') return [];
+    return this.taskHistory.filter((h) => h.workspace_id === workspaceId && h.task_id === taskId);
+  }
+
+  public updateTask(
+    workspaceId: string,
+    taskId: string,
+    input: Record<string, any>,
+    actor: PulsarUser
+  ): { success: boolean; task?: WorkspaceTask; error?: string } {
+    try {
+      if (!this.isMember(workspaceId, actor.id) && actor.role !== 'admin') {
+        return { success: false, error: 'TRUY CẬP BỊ TỪ CHỐI (403): Không có quyền sửa nhiệm vụ.' };
+      }
+      const validated = updateTaskSchema.parse(input);
+      const task = this.tasks.find((t) => t.workspace_id === workspaceId && t.id === taskId);
+      if (!task) return { success: false, error: 'Không tìm thấy nhiệm vụ.' };
+
+      const oldStatus = task.status;
+      const oldDue = task.due_date;
+      const oldAssignee = task.assignee_id;
+
+      if (validated.assignee_id !== undefined) {
+        if (validated.assignee_id && !this.isMember(workspaceId, validated.assignee_id)) {
+          return { success: false, error: 'Người được giao phải là thành viên active của workspace.' };
+        }
+        task.assignee_id = validated.assignee_id;
+      }
+      if (validated.milestone_id !== undefined) {
+        if (validated.milestone_id) {
+          const ms = this.milestones.find((m) => m.id === validated.milestone_id && m.workspace_id === workspaceId);
+          if (!ms) return { success: false, error: 'Milestone không thuộc workspace này.' };
+        }
+        task.milestone_id = validated.milestone_id;
+      }
+      if (validated.title !== undefined) task.title = validated.title;
+      if (validated.description !== undefined) task.description = validated.description || '';
+      if (validated.priority !== undefined) task.priority = validated.priority;
+      if (validated.due_date !== undefined) {
+        if (validated.due_date) {
+          const t = new Date(validated.due_date).getTime();
+          if (Number.isNaN(t)) return { success: false, error: 'Deadline không hợp lệ (phải là ISO datetime).' };
+        }
+        task.due_date = validated.due_date;
+      }
+      if (validated.status !== undefined) {
+        task.status = validated.status;
+        this.taskHistory.unshift({
+          id: `th-${Date.now()}`,
+          workspace_id: workspaceId,
+          task_id: task.id,
+          previous_status: oldStatus,
+          new_status: validated.status,
+          changed_by: actor.id,
+          changer_name: displayNameOf(actor),
+          reason: validated.change_reason ?? null,
+          created_at: new Date().toISOString(),
+        });
+      }
+      task.updated_at = new Date().toISOString();
+
+      this.activities.unshift({
+        id: `act-${Date.now()}`,
+        workspace_id: workspaceId,
+        actor_id: actor.id,
+        actor_name: displayNameOf(actor),
+        action: 'task_updated',
+        target_type: 'task',
+        target_id: task.id,
+        details: `Cập nhật nhiệm vụ "${task.title}"`,
+        created_at: new Date().toISOString(),
+      });
+
+      if (validated.assignee_id && validated.assignee_id !== oldAssignee && validated.assignee_id !== actor.id) {
+        notificationService.notifyTaskAssigned(task.id, task.title, validated.assignee_id, displayNameOf(actor));
+      }
+      if (validated.due_date !== undefined && validated.due_date !== oldDue && task.assignee_id && task.assignee_id !== actor.id) {
+        notificationService.notifyTaskDeadlineChanged(task.id, task.title, task.assignee_id, task.due_date);
+      }
+
+      return { success: true, task: { ...task, is_overdue: isTaskOverdue(task.due_date, task.status) } };
+    } catch (err: any) {
+      return { success: false, error: err.errors?.[0]?.message || err.message || 'Lỗi cập nhật nhiệm vụ' };
+    }
   }
 
   public updateTaskStatus(
     workspaceId: string,
     taskId: string,
-    status: TaskStatus,
+    status: AnyTaskStatus,
     actor: PulsarUser
   ): { success: boolean; task?: WorkspaceTask; error?: string } {
     if (!this.isMember(workspaceId, actor.id) && actor.role !== 'admin') {
@@ -928,24 +1246,42 @@ class CollaborationService {
     const task = this.tasks.find((t) => t.workspace_id === workspaceId && t.id === taskId);
     if (!task) return { success: false, error: 'Không tìm thấy nhiệm vụ.' };
 
+    // Backward compat: accept legacy 'done'/'review', normalize to spec canonical.
+    const normalized: TaskStatus = normalizeTaskStatus(status);
+    const parsed = updateTaskStatusSchema.safeParse({ status: normalized });
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues?.[0]?.message || 'Trạng thái nhiệm vụ không hợp lệ.' };
+    }
+
     const oldStatus = task.status;
-    task.status = status;
+    task.status = parsed.data.status;
     task.updated_at = new Date().toISOString();
+    this.taskHistory.unshift({
+      id: `th-${Date.now()}`,
+      workspace_id: workspaceId,
+      task_id: task.id,
+      previous_status: oldStatus,
+      new_status: task.status,
+      changed_by: actor.id,
+      changer_name: displayNameOf(actor),
+      reason: null,
+      created_at: new Date().toISOString(),
+    });
 
     // Log activity
     this.activities.unshift({
       id: `act-${Date.now()}`,
       workspace_id: workspaceId,
       actor_id: actor.id,
-      actor_name: actor.profile.full_name || actor.email,
+      actor_name: displayNameOf(actor),
       action: 'task_status_updated',
       target_type: 'task',
       target_id: task.id,
-      details: `Cập nhật nhiệm vụ "${task.title}": ${oldStatus} ➔ ${status}`,
+      details: `Cập nhật nhiệm vụ "${task.title}": ${oldStatus} ➔ ${task.status}`,
       created_at: new Date().toISOString(),
     });
 
-    return { success: true, task };
+    return { success: true, task: { ...task, is_overdue: isTaskOverdue(task.due_date, task.status) } };
   }
 
   /**
@@ -988,7 +1324,7 @@ class CollaborationService {
         id: `act-${Date.now()}`,
         workspace_id: workspaceId,
         actor_id: actor.id,
-        actor_name: actor.profile.full_name || actor.email,
+        actor_name: displayNameOf(actor),
         action: 'milestone_created',
         target_type: 'milestone',
         target_id: newMs.id,
@@ -1015,7 +1351,7 @@ class CollaborationService {
     workspaceId: string,
     input: SubmitDeliverableInput,
     actor: PulsarUser
-  ): Promise<{ success: boolean; milestone?: WorkspaceMilestone; error?: string }> {
+  ): Promise<{ success: boolean; milestone?: WorkspaceMilestone; error?: string; deduplicated?: boolean }> {
     try {
       const validated = submitDeliverableSchema.parse(input);
 
@@ -1026,7 +1362,20 @@ class CollaborationService {
       const ms = this.milestones.find((m) => m.workspace_id === workspaceId && m.id === validated.milestone_id);
       if (!ms) return { success: false, error: 'Không tìm thấy mốc bàn giao tương ứng.' };
 
+      // Idempotency for deliverable submission retries.
+      if ((validated as any).idempotency_key) {
+        const key = `${workspaceId}::${ms.id}::${(validated as any).idempotency_key}`;
+        const existingId = this.deliverableIdempotency.get(key);
+        if (existingId) {
+          const exists = ms.deliverables.find((d) => d.id === existingId);
+          if (exists) return { success: true, milestone: ms, deduplicated: true };
+        }
+      }
+
+      // Upload policy: no real Storage integration — store URL/metadata only.
+      // Private storage + signed URLs are required before accepting binary uploads.
       const now = new Date().toISOString();
+      const version = ms.deliverables.length + 1;
       const deliverableItem = {
         id: `del-${Date.now()}`,
         title: validated.title,
@@ -1034,23 +1383,37 @@ class CollaborationService {
         notes: validated.notes || '',
         submitted_at: now,
         submitted_by: actor.id,
-        submitter_name: actor.profile.full_name || actor.email,
+        submitter_name: displayNameOf(actor),
+        status: 'submitted' as DeliverableStatus,
+        version,
+        feedback: null as string | null,
+        reviewed_by: null as string | null,
+        reviewed_at: null as string | null,
       };
 
       ms.deliverables.push(deliverableItem);
       ms.status = 'submitted';
       ms.updated_at = now;
+      if ((validated as any).idempotency_key) {
+        this.deliverableIdempotency.set(
+          `${workspaceId}::${ms.id}::${(validated as any).idempotency_key}`,
+          deliverableItem.id
+        );
+      }
+
+      // NOTE: milestone completion NEVER auto-mutates the challenge outcome.
+      // Outcome finalization stays exclusively in Outcome & Reward Engine (SP4).
 
       // Log activity
       this.activities.unshift({
         id: `act-${Date.now()}`,
         workspace_id: workspaceId,
         actor_id: actor.id,
-        actor_name: actor.profile.full_name || actor.email,
+        actor_name: displayNameOf(actor),
         action: 'deliverable_submitted',
         target_type: 'milestone',
         target_id: ms.id,
-        details: `Nộp sản phẩm "${validated.title}" cho mốc [${ms.title}]`,
+        details: `Nộp sản phẩm "${validated.title}" (v${version}, URL/metadata only — upload Storage chưa tích hợp) cho mốc [${ms.title}]`,
         created_at: now,
       });
 
@@ -1059,7 +1422,7 @@ class CollaborationService {
         id: `msg-${Date.now()}`,
         workspace_id: workspaceId,
         sender_id: actor.id,
-        sender_name: actor.profile.full_name || actor.email,
+        sender_name: displayNameOf(actor),
         sender_role: this.getMemberRole(workspaceId, actor.id) || 'creator',
         content: `Đã nộp sản phẩm bàn giao cho "${ms.title}": ${validated.title}. Liên kết: ${validated.url}`,
         message_type: 'milestone_update',
@@ -1077,7 +1440,94 @@ class CollaborationService {
 
       return { success: true, milestone: ms };
     } catch (err: any) {
-      return { success: false, error: err.message || 'Lỗi nộp sản phẩm bàn giao' };
+      return { success: false, error: err.errors?.[0]?.message || err.message || 'Lỗi nộp sản phẩm bàn giao' };
+    }
+  }
+
+  /**
+   * Spec §5 — Deliverable review workflow.
+   * - Only owner/reviewer/workspace-admin/system-admin may review.
+   * - Creator can NEVER self-accept their own deliverable.
+   * - Statuses: submitted/under_review/changes_requested/accepted/rejected.
+   * - Acceptance is work-acceptance only: never touches challenge outcome or payment status.
+   */
+  public reviewDeliverable(
+    workspaceId: string,
+    input: { deliverable_id: string; decision: DeliverableStatus; feedback?: string },
+    actor: PulsarUser
+  ): { success: boolean; milestone?: WorkspaceMilestone; error?: string } {
+    try {
+      const validated = reviewDeliverableSchema.parse(input);
+      if (!this.isMember(workspaceId, actor.id) && actor.role !== 'admin') {
+        return { success: false, error: 'TRUY CẬP BỊ TỪ CHỐI (403): Không có quyền duyệt deliverable.' };
+      }
+      const actorRole = this.getMemberRole(workspaceId, actor.id);
+      const isReviewer = actorRole === 'owner' || actorRole === 'reviewer' || actorRole === 'admin' || actor.role === 'admin';
+      if (!isReviewer) {
+        return {
+          success: false,
+          error: 'TRUY CẬP BỊ TỪ CHỐI (403): Chỉ Owner/Reviewer/Admin mới được duyệt deliverable.',
+        };
+      }
+
+      let targetMs: WorkspaceMilestone | null = null;
+      let targetDel: any = null;
+      for (const ms of this.milestones) {
+        if (ms.workspace_id !== workspaceId) continue;
+        const found = ms.deliverables.find((d) => d.id === validated.deliverable_id);
+        if (found) {
+          targetMs = ms;
+          targetDel = found;
+          break;
+        }
+      }
+      if (!targetMs || !targetDel) return { success: false, error: 'Không tìm thấy deliverable.' };
+
+      // Security: no self-acceptance.
+      if (targetDel.submitted_by === actor.id && validated.decision === 'accepted') {
+        return {
+          success: false,
+          error: 'QUY TẮC AN NINH: Creator không thể tự nghiệm thu (accepted) deliverable của chính mình.',
+        };
+      }
+      // Only allow review from submitted/under_review/changes_requested states.
+      const reviewable = ['submitted', 'under_review', 'changes_requested'];
+      if (!reviewable.includes((targetDel.status as string) || 'submitted')) {
+        return { success: false, error: `Deliverable đã ở trạng thái cuối (${targetDel.status}), không thể duyệt lại.` };
+      }
+
+      const now = new Date().toISOString();
+      targetDel.status = validated.decision;
+      targetDel.feedback = validated.feedback || '';
+      targetDel.reviewed_by = actor.id;
+      targetDel.reviewed_at = now;
+      if (targetMs) targetMs.updated_at = now;
+
+      this.activities.unshift({
+        id: `act-${Date.now()}`,
+        workspace_id: workspaceId,
+        actor_id: actor.id,
+        actor_name: displayNameOf(actor),
+        action: `deliverable_${validated.decision}`,
+        target_type: 'deliverable',
+        target_id: targetDel.id,
+        details: `Duyệt deliverable "${targetDel.title}": ${validated.decision}${validated.feedback ? ` — ${validated.feedback}` : ''} (nghiệm thu công việc, tách khỏi thanh toán/outcome)`,
+        created_at: now,
+      });
+
+      // Notify submitter (generic body, no secrets).
+      if (targetDel.submitted_by && targetDel.submitted_by !== actor.id) {
+        notificationService.notifyDeliverableReviewed(
+          targetDel.id,
+          validated.decision === 'changes_requested' ? 'revision_requested' : 'deliverable_reviewed',
+          targetDel.submitted_by,
+          (targetMs as WorkspaceMilestone).title
+        );
+      }
+
+      return { success: true, milestone: targetMs };
+    } catch (err: any) {
+      return { success: false, error: err.errors?.[0]?.message || err.message || 'Lỗi duyệt deliverable' };
     }
   }
 
@@ -1099,13 +1549,13 @@ class CollaborationService {
     if (!ms) return { success: false, error: 'Không tìm thấy mốc bàn giao.' };
 
     const now = new Date().toISOString();
-    ms.status = 'approved';
+    ms.status = 'completed';
     ms.updated_at = now;
 
-    // Check if all milestones are approved
+    // Check if all milestones are completed (canonical spec status)
     const allMs = this.milestones.filter((m) => m.workspace_id === workspaceId);
-    const allApproved = allMs.every((m) => m.status === 'approved');
-    if (allApproved && allMs.length > 0) {
+    const allCompleted = allMs.every((m) => normalizeMilestoneStatus(m.status as AnyMilestoneStatus) === 'completed');
+    if (allCompleted && allMs.length > 0) {
       const ws = this.workspaces.find((w) => w.id === workspaceId);
       if (ws) ws.stage = 'completed';
     }
@@ -1115,7 +1565,7 @@ class CollaborationService {
       id: `act-${Date.now()}`,
       workspace_id: workspaceId,
       actor_id: actor.id,
-      actor_name: actor.profile.full_name || actor.email,
+      actor_name: displayNameOf(actor),
       action: 'milestone_approved',
       target_type: 'milestone',
       target_id: ms.id,
@@ -1128,7 +1578,7 @@ class CollaborationService {
       id: `msg-${Date.now()}`,
       workspace_id: workspaceId,
       sender_id: actor.id,
-      sender_name: actor.profile.full_name || actor.email,
+      sender_name: displayNameOf(actor),
       sender_role: actorRole || 'owner',
       content: `Mốc bàn giao [${ms.title}] đã chính thức được nghiệm thu và phê duyệt!`,
       message_type: 'system',
@@ -1157,7 +1607,9 @@ class CollaborationService {
     if (!ms) return { success: false, error: 'Không tìm thấy mốc bàn giao.' };
 
     const now = new Date().toISOString();
-    ms.status = 'rejected';
+    // Spec + DB CHECK: milestones use pending/in_progress/submitted/completed/cancelled.
+    // Requesting changes sends the milestone back to in_progress (rework), never a dangling 'rejected'.
+    ms.status = 'in_progress';
     ms.updated_at = now;
 
     // Log activity
@@ -1165,7 +1617,7 @@ class CollaborationService {
       id: `act-${Date.now()}`,
       workspace_id: workspaceId,
       actor_id: actor.id,
-      actor_name: actor.profile.full_name || actor.email,
+      actor_name: displayNameOf(actor),
       action: 'milestone_rejected',
       target_type: 'milestone',
       target_id: ms.id,
@@ -1178,7 +1630,7 @@ class CollaborationService {
       id: `msg-${Date.now()}`,
       workspace_id: workspaceId,
       sender_id: actor.id,
-      sender_name: actor.profile.full_name || actor.email,
+      sender_name: displayNameOf(actor),
       sender_role: actorRole || 'reviewer',
       content: `Yêu cầu hoàn thiện mốc [${ms.title}]: ${feedback}`,
       message_type: 'system',

@@ -166,12 +166,22 @@ describe('PULSAR Sprint 4: Outcome & Reward Engine Suite', () => {
       expect(res.error).toBeDefined();
     });
 
-    it('SEC-OUT-6: Business Owner can successfully update reward workflow and log status history', async () => {
-      const res = await outcomeRewardService.updateRewardStatus(
+    it('SEC-OUT-6: Business Owner re-processes via the audited workflow (ordinary paid→processing rejected)', async () => {
+      // SP8A.2 compatibility decision: paid is terminal on the ordinary path.
+      // Re-processing goes through requestRewardReprocessing (owner/admin +
+      // reason >= 15 chars + explicit audit entry) instead of a silent flip.
+      const ordinary = await outcomeRewardService.updateRewardStatus(
         'rwd-001',
         'processing',
         businessOwnerUser,
-        'Đang chuyển lệnh ủy nhiệm chi qua ngân hàng đối tác'
+        'Đường thường: thử mở lại'
+      );
+      expect(ordinary.error).toMatch(/không được phép/i);
+
+      const res = await outcomeRewardService.requestRewardReprocessing(
+        'rwd-001',
+        businessOwnerUser,
+        'Ủy nhiệm chi bị ngân hàng đối tác trả về, cần mở xử lý lại có kiểm toán'
       );
       expect(res.error).toBeNull();
       expect(res.data?.status).toBe('processing');
@@ -180,6 +190,7 @@ describe('PULSAR Sprint 4: Outcome & Reward Engine Suite', () => {
       const { data: history } = await outcomeRewardService.getRewardHistory('rwd-001');
       expect(history.length).toBeGreaterThan(0);
       expect(history[0].new_status).toBe('processing');
+      expect(history[0].reason).toMatch(/REPROCESSING/);
     });
   });
 

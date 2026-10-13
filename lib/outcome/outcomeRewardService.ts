@@ -16,6 +16,41 @@ import {
   type FinalizeOutcomeInput,
 } from '../validation/outcome.schema';
 
+// ==============================================================================
+// SP8A.1 — Explicit reward state-transition matrix ( defense in depth with
+// migration 20240109000001_reward_transition_guard.sql, which enforces the same
+// edges in PostgreSQL).
+//
+//   planned          -> pending_approval | cancelled   (entry state; never re-entered)
+//   pending_approval -> approved | cancelled
+//   approved         -> processing | cancelled
+//   processing       -> paid | failed | cancelled
+//   paid             -> (ordinary path: TERMINAL — re-processing ONLY via the
+//                        dedicated requestRewardReprocessing workflow below, which
+//                        requires owner/admin + non-recipient + reason >= 15 chars
+//                        and writes an explicit reprocessing audit entry)
+//   failed/cancelled -> (terminal; corrections via SP8A adjustments, never edits)
+//
+// `paid` set through this path is ATTESTED paid. Verified-paid requires an
+// authoritative payment record (see lib/finance/financialService.rewardStage).
+// ==============================================================================
+export const REWARD_TRANSITIONS: Record<RewardStatus, RewardStatus[]> = {
+  planned: ['pending_approval', 'cancelled'],
+  pending_approval: ['approved', 'cancelled'],
+  approved: ['processing', 'cancelled'],
+  processing: ['paid', 'failed', 'cancelled'],
+  paid: [],
+  failed: [],
+  cancelled: [],
+};
+
+export function isRewardTransitionAllowed(from: string, to: string): boolean {
+  if (from === to) return true; // idempotent no-op
+  const allowed = (REWARD_TRANSITIONS as Record<string, string[]>)[from];
+  if (!allowed) return false; // unknown current state: deny by default
+  return allowed.includes(to);
+}
+
 // Initial Mock / Local In-Memory State for reliable developer testing
 const INITIAL_OUTCOMES: ChallengeOutcome[] = [
   {
@@ -362,12 +397,19 @@ class OutcomeRewardService {
       return { data: null, error: 'Không tìm thấy thông tin giải thưởng' };
     }
 
-    // Phân quyền: Chỉ Doanh nghiệp sở hữu hoặc Super Admin
+    // Phân quyền: Chỉ chủ Doanh nghiệp sở hữu hoặc Super Admin.
+    // (SP8A.1 tightening: plain members/creators can no longer move financial
+    // states — previously any org member could set arbitrary statuses.)
     const isSuperAdmin = operator.role === 'admin';
-    const isOrgMember = operator.organizations?.some((m) => m.organization.id === reward.organization_id);
+    const isOrgOwner =
+      operator.organizations?.some(
+        (m) =>
+          m.organization.id === reward.organization_id &&
+          (m.membership_role === 'owner' || (m.membership_role as string) === 'admin')
+      ) ?? false;
 
-    if (!isSuperAdmin && !isOrgMember) {
-      return { data: null, error: 'Chỉ Doanh nghiệp cấp giải hoặc Quản trị viên mới có thể cập nhật trạng thái thưởng' };
+    if (!isSuperAdmin && !isOrgOwner) {
+      return { data: null, error: 'TRUY CẬP BỊ TỪ CHỐI (403): Chỉ chủ doanh nghiệp hoặc Quản trị viên mới có thể cập nhật trạng thái thưởng' };
     }
 
     // Creator không thể tự đánh dấu giải ngân cho chính mình
@@ -375,8 +417,21 @@ class OutcomeRewardService {
       return { data: null, error: 'Người nhận giải không được tự duyệt hoặc đánh dấu giải ngân cho chính mình' };
     }
 
+    // SP8A.1: explicit transition matrix — reject unsupported edges by default.
+    // `planned` is entry-only (never re-entered); `paid` here is ATTESTED paid.
+    if (!isRewardTransitionAllowed(reward.status, newStatus)) {
+      return {
+        data: null,
+        error: `Chuyển trạng thái không được phép: ${reward.status} → ${newStatus}. Trạng thái paid qua đường này chỉ là attested (xác nhận thủ công), không phải bằng chứng thanh toán.`,
+      };
+    }
+
     const previousStatus = reward.status;
     const now = new Date().toISOString();
+
+    if (previousStatus === newStatus) {
+      return { data: reward, error: null }; // idempotent no-op, no duplicate history
+    }
 
     reward.status = newStatus;
     reward.updated_at = now;
@@ -397,6 +452,62 @@ class OutcomeRewardService {
       changed_by: operator.id,
       changer_name: operator.profile.display_name,
       reason: notes || `Chuyển trạng thái sang ${newStatus}`,
+      created_at: now,
+    });
+
+    return { data: reward, error: null };
+  }
+
+  /**
+   * SP8A.2 — Dedicated audited re-processing workflow (paid -> processing).
+   * The SOLE application-layer path out of `paid`: the ordinary
+   * updateRewardStatus matrix treats paid as terminal. Stricter by design —
+   * org owner/admin, non-recipient, reason >= 15 chars, and an explicit
+   * REPROCESSING audit entry (never a silent status flip).
+   */
+  async requestRewardReprocessing(
+    rewardId: string,
+    operator: PulsarUser,
+    reason: string
+  ): Promise<{ data: Reward | null; error: string | null }> {
+    const reward = this.rewards.find((r) => r.id === rewardId);
+    if (!reward) {
+      return { data: null, error: 'Không tìm thấy thông tin giải thưởng' };
+    }
+    if (reward.status !== 'paid') {
+      return { data: null, error: `Chỉ giải thưởng ở trạng thái paid mới cần xử lý lại (hiện: ${reward.status}).` };
+    }
+
+    const isSuperAdmin = operator.role === 'admin';
+    const isOrgOwner =
+      operator.organizations?.some(
+        (m) =>
+          m.organization.id === reward.organization_id &&
+          (m.membership_role === 'owner' || (m.membership_role as string) === 'admin')
+      ) ?? false;
+
+    if (!isSuperAdmin && !isOrgOwner) {
+      return { data: null, error: 'TRUY CẬP BỊ TỪ CHỐI (403): Chỉ chủ doanh nghiệp hoặc Quản trị viên được yêu cầu xử lý lại giải ngân' };
+    }
+    if (operator.id === reward.recipient_id && !isSuperAdmin) {
+      return { data: null, error: 'Người nhận giải không được tự yêu cầu xử lý lại giải ngân của chính mình' };
+    }
+    if (!reason || reason.trim().length < 15) {
+      return { data: null, error: 'Lý do xử lý lại tối thiểu 15 ký tự để phục vụ kiểm toán.' };
+    }
+
+    const now = new Date().toISOString();
+    reward.status = 'processing';
+    reward.updated_at = now;
+
+    this.rewardHistory.unshift({
+      id: 'rsh-' + Math.random().toString(36).substring(2, 9),
+      reward_id: reward.id,
+      previous_status: 'paid',
+      new_status: 'processing',
+      changed_by: operator.id,
+      changer_name: operator.profile.display_name,
+      reason: `REPROCESSING (audited): ${reason.trim()}`,
       created_at: now,
     });
 

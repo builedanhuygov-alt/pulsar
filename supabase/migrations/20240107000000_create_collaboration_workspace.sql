@@ -196,11 +196,7 @@ USING (
         WHERE om.organization_id = workspaces.organization_id
         AND om.user_id = auth.uid()
     )
-    OR EXISTS (
-        SELECT 1 FROM public.profiles p
-        WHERE p.id = auth.uid()
-        AND p.role = 'admin'
-    )
+    OR public.is_admin()
 );
 
 -- Người tạo workspace: Chỉ Org Owner/Admin hoặc System Admin
@@ -211,13 +207,9 @@ WITH CHECK (
         SELECT 1 FROM public.organization_members om
         WHERE om.organization_id = workspaces.organization_id
         AND om.user_id = auth.uid()
-        AND om.role IN ('owner', 'admin')
+        AND om.membership_role = 'owner'
     )
-    OR EXISTS (
-        SELECT 1 FROM public.profiles p
-        WHERE p.id = auth.uid()
-        AND p.role = 'admin'
-    )
+    OR public.is_admin()
 );
 
 -- 8.2 WORKSPACE MEMBERS RLS
@@ -230,11 +222,7 @@ USING (
         AND wm2.user_id = auth.uid()
         AND wm2.status = 'active'
     )
-    OR EXISTS (
-        SELECT 1 FROM public.profiles p
-        WHERE p.id = auth.uid()
-        AND p.role = 'admin'
-    )
+    OR public.is_admin()
 );
 
 -- 8.3 MESSAGES RLS
@@ -248,11 +236,7 @@ USING (
         AND wm.user_id = auth.uid()
         AND wm.status = 'active'
     )
-    OR EXISTS (
-        SELECT 1 FROM public.profiles p
-        WHERE p.id = auth.uid()
-        AND p.role = 'admin'
-    )
+    OR public.is_admin()
 );
 
 CREATE POLICY "Messages insert policy"
@@ -277,11 +261,7 @@ USING (
         AND wm.user_id = auth.uid()
         AND wm.status = 'active'
     )
-    OR EXISTS (
-        SELECT 1 FROM public.profiles p
-        WHERE p.id = auth.uid()
-        AND p.role = 'admin'
-    )
+    OR public.is_admin()
 );
 
 CREATE POLICY "Tasks insert policy"
@@ -316,11 +296,7 @@ USING (
         AND wm.user_id = auth.uid()
         AND wm.status = 'active'
     )
-    OR EXISTS (
-        SELECT 1 FROM public.profiles p
-        WHERE p.id = auth.uid()
-        AND p.role = 'admin'
-    )
+    OR public.is_admin()
 );
 
 -- 8.6 DELIVERABLES RLS
@@ -333,11 +309,7 @@ USING (
         AND wm.user_id = auth.uid()
         AND wm.status = 'active'
     )
-    OR EXISTS (
-        SELECT 1 FROM public.profiles p
-        WHERE p.id = auth.uid()
-        AND p.role = 'admin'
-    )
+    OR public.is_admin()
 );
 
 CREATE POLICY "Deliverables insert policy"
